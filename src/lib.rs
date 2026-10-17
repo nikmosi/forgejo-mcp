@@ -25,8 +25,20 @@ pub fn create_app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/.well-known/oauth-protected-resource", get(oauth_protected_resource))
-        .route("/mcp", post(mcp::server::handle_mcp_request).layer(auth_layer))
+        .route(
+            "/mcp",
+            post(mcp::server::handle_mcp_request)
+                .layer(auth_layer)
+                .get(handle_mcp_get),
+        )
         .with_state(state)
+}
+
+pub async fn handle_mcp_get() -> impl IntoResponse {
+    Json(json!({
+        "name": "forgejo-mcp",
+        "status": "ready"
+    }))
 }
 
 pub async fn healthz() -> impl IntoResponse {
