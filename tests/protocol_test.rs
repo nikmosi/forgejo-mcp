@@ -435,3 +435,149 @@ async fn test_authelia_rs256_jwt_auth_expired() {
     let auth_val = auth_header.unwrap().to_str().unwrap();
     assert!(auth_val.contains("error=\"invalid_token\""));
 }
+
+#[tokio::test]
+async fn test_authelia_rs256_jwt_auth_missing_kid() {
+    let state = AppState::new(test_config());
+
+    let test_jwk = Jwk {
+        kty: "RSA".to_string(),
+        kid: Some("test-key-id-1".to_string()),
+        alg: Some("RS256".to_string()),
+        r#use: Some("sig".to_string()),
+        n: TEST_JWK_N.to_string(),
+        e: TEST_JWK_E.to_string(),
+    };
+    {
+        let mut cache = state.jwks_cache.write().await;
+        cache.jwks = Some(Jwks {
+            keys: vec![test_jwk],
+        });
+    }
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as usize;
+    let claims = TestJwtClaims {
+        iss: "https://auth.xinfra.ru".to_string(),
+        sub: "user-123".to_string(),
+        aud: "https://mcp-forgejo.xinfra.ru/mcp".to_string(),
+        exp: now + 3600,
+        nbf: now - 10,
+        iat: now,
+    };
+
+    // Header without kid
+    let header = Header::new(jsonwebtoken::Algorithm::RS256);
+
+    let token = encode(
+        &header,
+        &claims,
+        &EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes()).unwrap(),
+    )
+    .unwrap();
+
+    let app = create_app(state);
+    let ping_req = json!({
+        "jsonrpc": "2.0",
+        "id": 102,
+        "method": "ping"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/mcp")
+                .method("POST")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&ping_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let auth_header = response.headers().get(header::WWW_AUTHENTICATE);
+    assert!(auth_header.is_some());
+    let auth_val = auth_header.unwrap().to_str().unwrap();
+    assert!(auth_val.contains("error=\"invalid_token\""));
+}
+
+#[tokio::test]
+async fn test_authelia_rs256_jwks_refetch_cooldown() {
+    let state = AppState::new(test_config());
+
+    // Pre-populate JWKS cache with a key and recent last_fetched timestamp
+    let test_jwk = Jwk {
+        kty: "RSA".to_string(),
+        kid: Some("known-key".to_string()),
+        alg: Some("RS256".to_string()),
+        r#use: Some("sig".to_string()),
+        n: TEST_JWK_N.to_string(),
+        e: TEST_JWK_E.to_string(),
+    };
+    {
+        let mut cache = state.jwks_cache.write().await;
+        cache.jwks = Some(Jwks {
+            keys: vec![test_jwk],
+        });
+        cache.last_fetched = Some(std::time::Instant::now());
+    }
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as usize;
+    let claims = TestJwtClaims {
+        iss: "https://auth.xinfra.ru".to_string(),
+        sub: "user-123".to_string(),
+        aud: "https://mcp-forgejo.xinfra.ru/mcp".to_string(),
+        exp: now + 3600,
+        nbf: now - 10,
+        iat: now,
+    };
+
+    // Header with unknown kid
+    let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some("unknown-attacker-key".to_string());
+
+    let token = encode(
+        &header,
+        &claims,
+        &EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes()).unwrap(),
+    )
+    .unwrap();
+
+    let app = create_app(state);
+    let ping_req = json!({
+        "jsonrpc": "2.0",
+        "id": 103,
+        "method": "ping"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/mcp")
+                .method("POST")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&ping_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let auth_header = response.headers().get(header::WWW_AUTHENTICATE);
+    assert!(auth_header.is_some());
+    let auth_val = auth_header.unwrap().to_str().unwrap();
+    assert!(auth_val.contains("error=\"invalid_token\""));
+}
+
+#[test]
+fn test_jsonrpc_null_id_serialization() {
+    let resp = JsonRpcResponse::success(None, json!({ "status": "ok" }));
+    let serialized = serde_json::to_string(&resp).unwrap();
+    assert!(
+        serialized.contains(r#""id":null"#),
+        "JsonRpcResponse must serialize id as null when None: got {}",
+        serialized
+    );
+}

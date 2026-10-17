@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -157,7 +157,12 @@ pub async fn validate_jwt(token: &str, state: &AppState) -> Result<Claims, Strin
         return Err(format!("Unsupported algorithm: {:?}", header.alg));
     }
 
-    let jwk = get_jwk(header.kid.as_deref(), state).await?;
+    let kid = header
+        .kid
+        .as_deref()
+        .ok_or_else(|| "Missing 'kid' in JWT header".to_string())?;
+
+    let jwk = get_jwk(kid, state).await?;
     let decoding_key = DecodingKey::from_rsa_components(&jwk.n, &jwk.e)
         .map_err(|e| format!("Invalid RSA components: {e}"))?;
 
@@ -179,7 +184,9 @@ pub async fn validate_jwt(token: &str, state: &AppState) -> Result<Claims, Strin
     Ok(token_data.claims)
 }
 
-async fn get_jwk(kid: Option<&str>, state: &AppState) -> Result<Jwk, String> {
+async fn get_jwk(kid: &str, state: &AppState) -> Result<Jwk, String> {
+    const JWKS_REFETCH_COOLDOWN: Duration = Duration::from_secs(60);
+
     // 1. Check cache first
     {
         let cache = state.jwks_cache.read().await;
@@ -187,14 +194,24 @@ async fn get_jwk(kid: Option<&str>, state: &AppState) -> Result<Jwk, String> {
             if let Some(found) = find_jwk(jwks, kid) {
                 return Ok(found.clone());
             }
+
+            // Cooldown check: if cache was fetched recently, do not refetch from Authelia
+            if let Some(last_fetched) = cache.last_fetched {
+                if last_fetched.elapsed() < JWKS_REFETCH_COOLDOWN {
+                    return Err(format!(
+                        "Key ID '{}' not found in JWKS cache (refetch cooldown active)",
+                        kid
+                    ));
+                }
+            }
         }
     }
 
-    // 2. Fetch fresh JWKS if not found in cache
+    // 2. Fetch fresh JWKS if not found in cache and cooldown allows
     let fetched_jwks = fetch_jwks(&state.config.authelia_url).await?;
     let found = find_jwk(&fetched_jwks, kid)
         .cloned()
-        .ok_or_else(|| format!("Key ID {:?} not found in JWKS", kid))?;
+        .ok_or_else(|| format!("Key ID '{}' not found in JWKS", kid))?;
 
     // Update cache
     let mut cache = state.jwks_cache.write().await;
@@ -204,12 +221,8 @@ async fn get_jwk(kid: Option<&str>, state: &AppState) -> Result<Jwk, String> {
     Ok(found)
 }
 
-pub fn find_jwk<'a>(jwks: &'a Jwks, kid: Option<&str>) -> Option<&'a Jwk> {
-    if let Some(kid) = kid {
-        jwks.keys.iter().find(|k| k.kid.as_deref() == Some(kid))
-    } else {
-        jwks.keys.iter().find(|k| k.kty == "RSA")
-    }
+pub fn find_jwk<'a>(jwks: &'a Jwks, kid: &str) -> Option<&'a Jwk> {
+    jwks.keys.iter().find(|k| k.kid.as_deref() == Some(kid))
 }
 
 async fn fetch_jwks(authelia_url: &str) -> Result<Jwks, String> {
