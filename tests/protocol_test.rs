@@ -581,3 +581,122 @@ fn test_jsonrpc_null_id_serialization() {
         serialized
     );
 }
+
+#[tokio::test]
+async fn test_authelia_cold_cache_miss_updates_last_fetched_and_cooldown() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use axum::routing::get;
+    use axum::Json;
+    use axum::Router;
+
+    let fetch_count = Arc::new(AtomicUsize::new(0));
+    let fetch_count_clone = fetch_count.clone();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let mock_auth = Router::new().route(
+        "/jwks.json",
+        get(move || {
+            let count = fetch_count_clone.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Json(json!({
+                    "keys": [{
+                        "kty": "RSA",
+                        "kid": "mock-key-only",
+                        "alg": "RS256",
+                        "use": "sig",
+                        "n": TEST_JWK_N,
+                        "e": TEST_JWK_E
+                    }]
+                }))
+            }
+        }),
+    );
+
+    tokio::spawn(async move {
+        axum::serve(listener, mock_auth).await.unwrap();
+    });
+
+    let config = AppConfig {
+        port: 8000,
+        host: "0.0.0.0".to_string(),
+        authelia_url: format!("http://{}", addr),
+        resource_url: "https://mcp-forgejo.xinfra.ru/mcp".to_string(),
+        static_api_key: None,
+        target_url: "http://forgejo:3000".to_string(),
+        target_token: "".to_string(),
+    };
+
+    let state = AppState::new(config);
+    // Cold cache: jwks is None, last_fetched is None
+    assert!(state.jwks_cache.read().await.last_fetched.is_none());
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as usize;
+    let claims = TestJwtClaims {
+        iss: format!("http://{}", addr),
+        sub: "user-123".to_string(),
+        aud: "https://mcp-forgejo.xinfra.ru/mcp".to_string(),
+        exp: now + 3600,
+        nbf: now - 10,
+        iat: now,
+    };
+
+    let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some("unknown-kid".to_string());
+
+    let token = encode(
+        &header,
+        &claims,
+        &EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes()).unwrap(),
+    )
+    .unwrap();
+
+    let app = create_app(state.clone());
+    let ping_req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "ping"
+    });
+
+    // 1st request: cold cache triggers remote fetch, kid not found
+    let response1 = app.clone()
+        .oneshot(
+            Request::builder()
+                .uri("/mcp")
+                .method("POST")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&ping_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response1.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+
+    // Verify cache.last_fetched was updated despite kid not being in the keyset!
+    assert!(state.jwks_cache.read().await.last_fetched.is_some());
+    assert!(state.jwks_cache.read().await.jwks.is_some());
+
+    // 2nd request: cooldown active, should NOT fetch remotely again
+    let response2 = app
+        .oneshot(
+            Request::builder()
+                .uri("/mcp")
+                .method("POST")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&ping_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response2.status(), StatusCode::UNAUTHORIZED);
+    // fetch_count must remain 1 because cooldown prevented remote refetch
+    assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+}

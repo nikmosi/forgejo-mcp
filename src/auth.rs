@@ -209,16 +209,16 @@ async fn get_jwk(kid: &str, state: &AppState) -> Result<Jwk, String> {
 
     // 2. Fetch fresh JWKS if not found in cache and cooldown allows
     let fetched_jwks = fetch_jwks(&state.config.authelia_url).await?;
-    let found = find_jwk(&fetched_jwks, kid)
-        .cloned()
-        .ok_or_else(|| format!("Key ID '{}' not found in JWKS", kid))?;
+    let found = find_jwk(&fetched_jwks, kid).cloned();
 
-    // Update cache
-    let mut cache = state.jwks_cache.write().await;
-    cache.jwks = Some(fetched_jwks);
-    cache.last_fetched = Some(Instant::now());
+    // Update cache regardless of whether kid was found in the new keyset
+    {
+        let mut cache = state.jwks_cache.write().await;
+        cache.jwks = Some(fetched_jwks);
+        cache.last_fetched = Some(Instant::now());
+    }
 
-    Ok(found)
+    found.ok_or_else(|| format!("Key ID '{}' not found in JWKS", kid))
 }
 
 pub fn find_jwk<'a>(jwks: &'a Jwks, kid: &str) -> Option<&'a Jwk> {
