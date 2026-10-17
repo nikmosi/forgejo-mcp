@@ -37,8 +37,8 @@ pub async fn oauth_protected_resource(State(state): State<AppState>) -> impl Int
     let metadata = mcp::types::ProtectedResourceMetadata {
         resource: state.config.resource_url.clone(),
         authorization_servers: vec![state.config.authelia_url.clone()],
-        scopes: vec!["openid".to_string(), "profile".to_string(), "email".to_string()],
-        scopes_supported: vec!["openid".to_string(), "profile".to_string(), "email".to_string()],
+        scopes: vec!["openid".to_string(), "profile".to_string(), "email".to_string(), "offline_access".to_string()],
+        scopes_supported: vec!["openid".to_string(), "profile".to_string(), "email".to_string(), "offline_access".to_string()],
         bearer_methods: vec!["header".to_string()],
         bearer_methods_supported: vec!["header".to_string()],
     };
