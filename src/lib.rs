@@ -1,7 +1,11 @@
 pub mod auth;
+pub mod client;
 pub mod config;
 pub mod mcp;
 pub mod state;
+pub mod tools;
+
+pub use client::ForgejoClient;
 
 use axum::{
     extract::State,
